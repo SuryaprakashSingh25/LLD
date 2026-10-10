@@ -1,40 +1,36 @@
 package ParkingLot;
 
-import ParkingLot.Parking.ParkingFloor;
-import ParkingLot.Parking.ParkingSpot;
-import ParkingLot.Payment.Payment;
-import ParkingLot.Payment.PaymentFactory;
-import ParkingLot.Price.HourlyPricing;
-import ParkingLot.Price.PricingStrategy;
-import ParkingLot.Vehicles.Vehicle;
-import ParkingLot.enums.PaymentType;
-import ParkingLot.enums.SpotType;
-import ParkingLot.enums.VehicleType;
+import ParkingLot.entities.ParkingFloor;
+import ParkingLot.entities.ParkingSpot;
+import ParkingLot.entities.ParkingTicket;
+import ParkingLot.strategy.fee.FeeStrategy;
+import ParkingLot.strategy.fee.FlatRateFeeStrategy;
+import ParkingLot.strategy.parking.BestFitStrategy;
+import ParkingLot.strategy.parking.ParkingStrategy;
+import ParkingLot.vehicle.Vehicle;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-
-import static ParkingLot.enums.VehicleType.*;
 
 public class ParkingLot {
-    private static volatile ParkingLot instance;
-    private final String name;
-    private final List<ParkingFloor> floors=new CopyOnWriteArrayList<>();
-    private final ConcurrentHashMap<String,Ticket> activeTickets=new ConcurrentHashMap<>();
-    private PricingStrategy pricingStrategy=new HourlyPricing(5.0);
+    private static ParkingLot instance;
+    private final List<ParkingFloor> floors=new ArrayList<>();
+    private final Map<String, ParkingTicket> activeTickets;
+    private FeeStrategy feeStrategy;
+    private ParkingStrategy parkingStrategy;
 
-    private ParkingLot(String name){
-        this.name=name;
+    private ParkingLot(){
+        this.feeStrategy=new FlatRateFeeStrategy();
+        this.parkingStrategy=new BestFitStrategy();
+        this.activeTickets=new ConcurrentHashMap<>();
     }
 
-    public static ParkingLot getInstance(String name){
+    public static synchronized ParkingLot getInstance(){
         if(instance==null){
-            synchronized (ParkingLot.class){
-                if(instance==null){
-                    instance=new ParkingLot(name);
-                }
-            }
+            instance=new ParkingLot();
         }
         return instance;
     }
@@ -43,58 +39,37 @@ public class ParkingLot {
         floors.add(floor);
     }
 
-    public void setPricingStrategy(PricingStrategy strategy){
-        this.pricingStrategy=strategy;
+    public void setFeeStrategy(FeeStrategy feeStrategy){
+        this.feeStrategy=feeStrategy;
     }
 
-    private boolean isSpotCompatible(VehicleType vehicleType, SpotType spotType){
-        switch (vehicleType){
-            case MOTORCYCLE: return spotType==SpotType.MOTORCYCLE || spotType==SpotType.COMPACT || spotType==SpotType.LARGE;
-            case CAR: return spotType==SpotType.COMPACT || spotType==SpotType.LARGE;
-            case TRUCK: return spotType==SpotType.LARGE;
-            default: return false;
+    public void setParkingStrategy(ParkingStrategy parkingStrategy){
+        this.parkingStrategy=parkingStrategy;
+    }
+
+    public Optional<ParkingTicket> parkVehicle(Vehicle vehicle){
+        Optional<ParkingSpot> availableSpot=parkingStrategy.findSpot(floors,vehicle);
+        if(availableSpot.isPresent()){
+            ParkingSpot spot=availableSpot.get();
+            spot.parkVehicle(vehicle);
+            ParkingTicket ticket=new ParkingTicket(vehicle,spot);
+            activeTickets.put(vehicle.getLicenseNumber(),ticket);
+            System.out.printf("%s parked at %s. Ticket: %s\n", vehicle.getLicenseNumber(), spot.getSpotId(), ticket.getTicketId());
+            return Optional.of(ticket);
         }
+        System.out.println("No available spot for " + vehicle.getLicenseNumber());
+        return Optional.empty();
     }
 
-    public synchronized Ticket parkVehicle(Vehicle vehicle){
-        for(ParkingFloor floor:floors){
-            for(ParkingSpot spot: floor.getSpots()){
-                if(spot.isAvailable() && isSpotCompatible(vehicle.getType(), spot.getType())){
-                    if(spot.reserve(vehicle)){
-                        Ticket ticket=new Ticket(vehicle,spot);
-                        activeTickets.put(ticket.getTicketId(),ticket);
-                        System.out.printf("[ParkingSuccess] %s (%s) parked at spot %s on floor %s. Ticket: %s\n",
-                                vehicle.getType(), vehicle.getLicensePlate(), spot.getId(), floor.getName(), ticket.getTicketId());
-                        return ticket;
-                    }
-                }
-            }
-        }
-        System.out.printf("[ParkingFailed] No compatible spot available for %s (%s)\n", vehicle.getType(), vehicle.getLicensePlate());
-        return null;
-    }
-
-    public synchronized boolean checkoutVehicle(String ticketId, PaymentType paymentType){
-        Ticket ticket=activeTickets.get(ticketId);
+    public Optional<Double> unparkVehicle(String licenseNumber){
+        ParkingTicket ticket=activeTickets.remove(licenseNumber);
         if(ticket==null){
-            System.out.println("[CheckoutError] Ticket ID " + ticketId + " not found.");
-            return false;
+            System.out.println("Ticket not found");
+            return Optional.empty();
         }
-
-        ticket.setExitTime(System.currentTimeMillis()+7200000);
-        long duration=ticket.getExitTime()-ticket.getEntryTime();
-        double fee=pricingStrategy.calculateFee(duration);
-        ticket.setFee(fee);
-
-        Payment payment= PaymentFactory.createPayment(paymentType,fee);
-        if(payment.process()){
-            ticket.pay();
-            ticket.getSpot().release();
-            activeTickets.remove(ticketId);
-            System.out.printf("[CheckoutSuccess] Ticket %s resolved. Fee: $%.2f. Spot %s is vacant.\n",
-                    ticketId, fee, ticket.getSpot().getId());
-            return true;
-        }
-        return false;
+        ticket.setExitTimestamp();
+        ticket.getSpot().unparkVehicle();
+        Double parkingFee=feeStrategy.calculateFee(ticket);
+        return Optional.of(parkingFee);
     }
 }
